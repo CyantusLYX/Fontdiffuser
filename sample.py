@@ -41,6 +41,13 @@ def arg_parse():
                         help="The saving directory.")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--ttf_path", type=str, default="ttf/NotoSansTC-Thin.ttf")
+    # A100 優化參數
+    parser.add_argument("--parallel_processing", action="store_true", 
+                        help="Enable parallel processing for character generation")
+    parser.add_argument("--chunk_size", type=int, default=10, 
+                        help="Number of characters to process in parallel")
+    parser.add_argument("--use_amp", action="store_true", 
+                        help="Use automatic mixed precision for faster computation")
     args = parser.parse_args()
     style_image_size = args.style_image_size
     content_image_size = args.content_image_size
@@ -138,60 +145,191 @@ def sampling(args, pipe):
             characters = list(f.read().strip())  # 将文件内容拆分为单个字符
     else:
         raise ValueError("character_list_path must be provided.")
+    
+    # A100 優化：批次處理字符
+    if args.parallel_processing:
+        # 將字符列表分成chunks進行處理
+        for i in range(0, len(characters), args.chunk_size):
+            chunk = characters[i:i+args.chunk_size]
+            valid_chars = []
+            content_images = []
+            style_images = []
+            content_image_pils = []
+            
+            # 收集有效的字符和對應的圖像
+            for char in chunk:
+                char = char.strip()
+                if len(char) != 1:
+                    print(f"Invalid character '{char}'. Skipping.")
+                    continue
+                
+                # --- 新增：檢查輸出檔案是否存在 ---
+                output_filename = f'U+{hex(ord(char))[2:].upper()}.png'
+                output_filepath = os.path.join(args.save_image_dir, output_filename)
+                if args.save_image and os.path.exists(output_filepath):
+                    print(f"Output file for character '{char}' already exists. Skipping.")
+                    continue
+                # --- 檢查結束 ---
 
-    for char in characters:
-        char = char.strip()  # Ensure no leading/trailing whitespace
-        if len(char) != 1:
-            print(f"Invalid character '{char}'. Skipping.")
-            continue
-
-        content_image, style_image, content_image_pil = image_process(args=args, content_character=char)
-        if content_image is None:
-            print(f"The content_character '{char}' is not in the ttf. Skipping.")
-            continue
-
-        with torch.no_grad():
-            content_image = content_image.to(args.device)
-            style_image = style_image.to(args.device)
-            print(f"Sampling by DPM-Solver++ for character '{char}' ......")
+                content_image, style_image, content_image_pil = image_process(args=args, content_character=char)
+                if content_image is None:
+                    print(f"The content_character '{char}' is not in the ttf. Skipping.")
+                    continue
+                
+                valid_chars.append(char)
+                content_images.append(content_image)
+                style_images.append(style_image)
+                content_image_pils.append(content_image_pil)
+            
+            if len(valid_chars) == 0:
+                continue
+                
+            # 合併張量以批次處理
+            content_batch = torch.cat(content_images, dim=0).to(args.device)
+            style_batch = torch.cat(style_images, dim=0).to(args.device)
+            
+            print(f"Processing batch of {len(valid_chars)} characters...")
             start = time.time()
-            images = pipe.generate(
-                content_images=content_image,
-                style_images=style_image,
-                batch_size=1,
-                order=args.order,
-                num_inference_step=args.num_inference_steps,
-                content_encoder_downsample_size=args.content_encoder_downsample_size,
-                t_start=args.t_start,
-                t_end=args.t_end,
-                dm_size=args.content_image_size,
-                algorithm_type=args.algorithm_type,
-                skip_type=args.skip_type,
-                method=args.method,
-                correcting_x0_fn=args.correcting_x0_fn)
+            
+            # 使用AMP進行混合精度訓練（如果啟用）
+            if args.use_amp:
+                with torch.cuda.amp.autocast():
+                    with torch.no_grad():
+                        images = pipe.generate(
+                            content_images=content_batch,
+                            style_images=style_batch,
+                            batch_size=len(valid_chars),  # 批次處理所有有效字符
+                            order=args.order,
+                            num_inference_step=args.num_inference_steps,
+                            content_encoder_downsample_size=args.content_encoder_downsample_size,
+                            t_start=args.t_start,
+                            t_end=args.t_end,
+                            dm_size=args.content_image_size,
+                            algorithm_type=args.algorithm_type,
+                            skip_type=args.skip_type,
+                            method=args.method,
+                            correcting_x0_fn=args.correcting_x0_fn)
+            else:
+                with torch.no_grad():
+                    images = pipe.generate(
+                        content_images=content_batch,
+                        style_images=style_batch,
+                        batch_size=len(valid_chars),  # 批次處理所有有效字符
+                        order=args.order,
+                        num_inference_step=args.num_inference_steps,
+                        content_encoder_downsample_size=args.content_encoder_downsample_size,
+                        t_start=args.t_start,
+                        t_end=args.t_end,
+                        dm_size=args.content_image_size,
+                        algorithm_type=args.algorithm_type,
+                        skip_type=args.skip_type,
+                        method=args.method,
+                        correcting_x0_fn=args.correcting_x0_fn)
+                    
             end = time.time()
-
+            print(f"Batch processing time: {end - start}s")
+            
+            # 保存生成的圖像
             if args.save_image:
-                print(f"Saving the image for character '{char}' ......")
-                save_single_image(save_dir=args.save_image_dir, image=images[0], image_name=f'U+{hex(ord(char))[2:].upper()}.png')
-                if args.character_input:
-                    save_image_with_content_style(save_dir=args.save_image_dir,
-                                                  image=images[0],
-                                                  content_image_pil=content_image_pil,
-                                                  content_image_path=None,
-                                                  style_image_path=args.style_image_path,
-                                                  resolution=args.resolution)
-                else:
-                    save_image_with_content_style(save_dir=args.save_image_dir,
-                                                  image=images[0],
-                                                  content_image_pil=None,
-                                                  content_image_path=args.content_image_path,
-                                                  style_image_path=args.style_image_path,
-                                                  resolution=args.resolution)
-                print(f"Finish the sampling process for character '{char}', costing time {end - start}s")
-    return images[0]
+                for idx, char in enumerate(valid_chars):
+                    # --- 修改：使用之前計算好的檔名 ---
+                    output_filename = f'U+{hex(ord(char))[2:].upper()}.png'
+                    print(f"Saving the image for character '{char}' as {output_filename} ......")
+                    save_single_image(save_dir=args.save_image_dir, image=images[idx], image_name=output_filename)
+                    # --- 修改結束 ---
+                    if args.character_input:
+                        save_image_with_content_style(save_dir=args.save_image_dir,
+                                                    image=images[idx],
+                                                    content_image_pil=content_image_pils[idx],
+                                                    content_image_path=None,
+                                                    style_image_path=args.style_image_path,
+                                                    resolution=args.resolution)
+                    else:
+                        save_image_with_content_style(save_dir=args.save_image_dir,
+                                                    image=images[idx],
+                                                    content_image_pil=None,
+                                                    content_image_path=args.content_image_path,
+                                                    style_image_path=args.style_image_path,
+                                                    resolution=args.resolution)
+    else:
+        # 原始單個字符處理邏輯...
+        processed_count = 0 # 用於追蹤實際處理的圖像數量
+        for char in characters:
+            char = char.strip()  # Ensure no leading/trailing whitespace
+            if len(char) != 1:
+                print(f"Invalid character '{char}'. Skipping.")
+                continue
 
+            # --- 新增：檢查輸出檔案是否存在 ---
+            output_filename = f'U+{hex(ord(char))[2:].upper()}.png'
+            output_filepath = os.path.join(args.save_image_dir, output_filename)
+            if args.save_image and os.path.exists(output_filepath):
+                print(f"Output file for character '{char}' already exists. Skipping.")
+                continue
+            # --- 檢查結束 ---
 
+            content_image, style_image, content_image_pil = image_process(args=args, content_character=char)
+            if content_image is None:
+                print(f"The content_character '{char}' is not in the ttf. Skipping.")
+                continue
+
+            with torch.no_grad():
+                content_image = content_image.to(args.device)
+                style_image = style_image.to(args.device)
+                print(f"Sampling by DPM-Solver++ for character '{char}' ......")
+                start = time.time()
+                images = pipe.generate(
+                    content_images=content_image,
+                    style_images=style_image,
+                    batch_size=1,
+                    order=args.order,
+                    num_inference_step=args.num_inference_steps,
+                    content_encoder_downsample_size=args.content_encoder_downsample_size,
+                    t_start=args.t_start,
+                    t_end=args.t_end,
+                    dm_size=args.content_image_size,
+                    algorithm_type=args.algorithm_type,
+                    skip_type=args.skip_type,
+                    method=args.method,
+                    correcting_x0_fn=args.correcting_x0_fn)
+                end = time.time()
+                processed_count += 1 # 增加計數
+
+                if args.save_image:
+                    # --- 修改：使用之前計算好的檔名 ---
+                    print(f"Saving the image for character '{char}' as {output_filename} ......")
+                    save_single_image(save_dir=args.save_image_dir, image=images[0], image_name=output_filename)
+                    # --- 修改結束 ---
+                    if args.character_input:
+                        save_image_with_content_style(save_dir=args.save_image_dir,
+                                                      image=images[0],
+                                                      content_image_pil=content_image_pil,
+                                                      content_image_path=None,
+                                                      style_image_path=args.style_image_path,
+                                                      resolution=args.resolution)
+                    else:
+                        save_image_with_content_style(save_dir=args.save_image_dir,
+                                                      image=images[0],
+                                                      content_image_pil=None,
+                                                      content_image_path=args.content_image_path,
+                                                      style_image_path=args.style_image_path,
+                                                      resolution=args.resolution)
+                    print(f"Finish the sampling process for character '{char}', costing time {end - start}s")
+        # --- 修改：確保在沒有處理任何圖像時也能返回 ---
+        if processed_count == 0:
+             print("No new characters processed.")
+             return None # 或者返回一個預設值
+        # --- 修改結束 ---
+    # --- 修改：確保在並行處理時也能返回最後一個批次的結果 ---
+    # 注意：在並行模式下，返回最後一個批次的 images 可能不是最有意義的行為
+    # 但為了保持函數簽名一致，我們暫時這樣處理
+    if 'images' in locals():
+        return images[0] if images is not None and len(images) > 0 else None
+    else:
+        # 如果因為所有字符都被跳過而沒有生成任何圖像
+        print("No images were generated (all characters might have been skipped).")
+        return None
+    # --- 修改結束 ---
 
 
 def load_controlnet_pipeline(args,
@@ -262,3 +400,9 @@ if __name__=="__main__":
     # load fontdiffuser pipeline
     pipe = load_fontdiffuer_pipeline(args=args)
     out_image = sampling(args=args, pipe=pipe)
+    # --- 修改：處理 sampling 可能返回 None 的情況 ---
+    if out_image is not None:
+        print("Sampling finished. Last generated image (or last image of the last batch) is available in out_image variable (if needed).")
+    else:
+        print("Sampling finished, but no new image was generated or returned.")
+    # --- 修改結束 ---
